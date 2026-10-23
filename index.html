@@ -185,7 +185,6 @@ input[type=color]{width:44px;height:36px;border:0;background:none;padding:0}
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const h=(t,c)=>{const e=document.createElement(t); if(c)e.className=c; return e;};
 const cv=$('#cv'), ctx=cv.getContext('2d');
-const bgc=document.createElement('canvas'), bctx=bgc.getContext('2d');
 
 const ASPECTS={'9:16':[1080,1920],'4:5':[1080,1350],'1:1':[1080,1080],'16:9':[1920,1080]};
 const PREVIEW_SCALE=0.4;
@@ -193,9 +192,10 @@ const TR=[['none','Нет','✂'],['fade','Плавно','◐'],['black','Чер
 const TICON=Object.fromEntries(TR.map(t=>[t[0],t[2]]));
 const POS=[['top','Сверху'],['mid','Центр'],['bottom','Снизу']];
 const SPEEDS=[0.5,1,1.5,2,3];
+const PRE=0.5, WARM=0.3, BG_EVERY=150;
 
 const state={clips:[],sel:-1,t:0,playing:false,exporting:false,music:null,musicVol:0.6,fit:'fill',aspect:'9:16',stopAt:null};
-let uid=0, raf=0, wall0=0, t0=0, pendingRender=0;
+let uid=0, raf=0, wall0=0, t0=0, pendingRender=0, lastSig='';
 let audioCtx=null, speakerGain=null, recDest=null;
 
 /* ---------- утилиты ---------- */
@@ -251,6 +251,13 @@ async function thumbOf(v,t){
   try{c.getContext('2d').drawImage(v,0,0,c.width,c.height);}catch(e){}
   return c.toDataURL('image/jpeg',0.6);
 }
+// счётчик новых кадров видео: холст перерисовываем только когда кадр сменился
+function watchFrames(c){
+  c.frames=0; c.frameAt=0; c.rvfc='requestVideoFrameCallback' in c.el;
+  if(!c.rvfc)return;
+  const cb=()=>{c.frames++;c.frameAt=performance.now();c.el.requestVideoFrameCallback(cb);};
+  c.el.requestVideoFrameCallback(cb);
+}
 async function buildClip(url,type,name){
   const base={id:++uid,name,type,url,speed:1,vol:1,trans:{type:'fade',dur:0.4},text:'',tpos:'bottom',tsize:7,tcolor:'#ffffff',state:'idle',gain:null};
   if(type==='image'){
@@ -262,6 +269,7 @@ async function buildClip(url,type,name){
   v.addEventListener('seeked',()=>{if(!state.playing)scheduleRender();});
   const dur=(isFinite(v.duration)&&v.duration>0)?v.duration:1;
   const c={...base,el:v,dur,in:0,out:dur};
+  watchFrames(c);
   try{c.thumb=await thumbOf(v,Math.min(0.1,dur/2));}catch(e){c.thumb='';}
   return c;
 }
@@ -319,6 +327,19 @@ function setCanvasSize(scale){
   cv.width=Math.round(w*scale/2)*2; cv.height=Math.round(h2*scale/2)*2;
 }
 function srcSize(c){return c.type==='video'?[c.el.videoWidth,c.el.videoHeight]:[c.el.naturalWidth,c.el.naturalHeight];}
+// размытый фон для режима «Вписать»: свой маленький холст у клипа, при воспроизведении обновляется не чаще BG_EVERY мс
+function bgFor(c,sw,sh,W,H){
+  const bw=24, bh=Math.max(8,Math.round(24*H/W)), now=performance.now();
+  let b=c.bg;
+  if(!b){b=c.bg=document.createElement('canvas');b.at=-1e9;}
+  if(b.width!==bw||b.height!==bh){b.width=bw;b.height=bh;b.at=-1e9;}
+  if(!state.playing||now-b.at>BG_EVERY){
+    const s=Math.max(bw/sw,bh/sh);
+    b.getContext('2d').drawImage(c.el,(bw-sw*s)/2,(bh-sh*s)/2,sw*s,sh*s);
+    b.at=now;
+  }
+  return b;
+}
 function drawClip(c,alpha,tx,ty,sc){
   const [sw,sh]=srcSize(c); if(!sw||!sh)return;
   const W=cv.width,H=cv.height;
@@ -327,11 +348,8 @@ function drawClip(c,alpha,tx,ty,sc){
   ctx.translate(W/2+tx,H/2+ty); ctx.scale(sc,sc); ctx.translate(-W/2,-H/2);
   try{
     if(state.fit==='fit'){
-      bgc.width=24; bgc.height=Math.max(8,Math.round(24*H/W));
-      const s=Math.max(bgc.width/sw,bgc.height/sh);
-      bctx.drawImage(c.el,(bgc.width-sw*s)/2,(bgc.height-sh*s)/2,sw*s,sh*s);
       ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
-      ctx.drawImage(bgc,0,0,W,H);
+      ctx.drawImage(bgFor(c,sw,sh,W,H),0,0,W,H);
       ctx.fillStyle='rgba(0,0,0,.4)'; ctx.fillRect(0,0,W,H);
       const k=Math.min(W/sw,H/sh);
       ctx.drawImage(c.el,(W-sw*k)/2,(H-sh*k)/2,sw*k,sh*k);
@@ -385,6 +403,7 @@ function drawText(c,local,len){
   ctx.restore();
 }
 function render(t){
+  lastSig='';
   const W=cv.width,H=cv.height;
   ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
   const L=layout(); if(!L.length)return;
@@ -397,6 +416,21 @@ function render(t){
     drawTransition(state.clips[a],state.clips[b],state.clips[a].trans.type,p);
   }
   act.forEach(i=>drawText(state.clips[i],t-L[i].start,L[i].len));
+}
+// подпись текущего кадра; null — кадр анимируется (переход, появление текста) или кадры видео не отслеживаются
+function frameSig(t){
+  const L=layout(), now=performance.now(), sig=[];
+  for(let i=0;i<L.length;i++){
+    const l=L[i]; if(t<l.start||t>=l.end)continue;
+    const c=state.clips[i], local=t-l.start;
+    if(sig.length)return null;
+    if(c.text.trim()&&(local<0.25||l.len-local<0.25))return null;
+    if(c.type==='video'){
+      if(!c.rvfc||now-c.frameAt>250)return null;
+      sig.push(i,c.frames);
+    }else sig.push(i,-1);
+  }
+  return sig.join(':');
 }
 function scheduleRender(){
   if(pendingRender)return;
@@ -417,7 +451,7 @@ function syncMedia(t){
   const L=layout();
   state.clips.forEach((c,i)=>{
     const l=L[i], img=c.type==='image';
-    const inside=t>=l.start&&t<l.end, pre=t>=l.start-0.5&&t<l.start;
+    const inside=t>=l.start&&t<l.end, pre=t>=l.start-PRE&&t<l.start;
     if(inside){
       if(!img){
         const want=c.in+(t-l.start)*c.speed;
@@ -425,19 +459,33 @@ function syncMedia(t){
           if(Math.abs(c.el.currentTime-want)>0.15){try{c.el.currentTime=want;}catch(e){}}
           c.el.playbackRate=c.speed;
           c.el.play().catch(()=>{});
-        }else if(Math.abs(c.el.currentTime-want)>0.3&&!c.el.ended){
-          try{c.el.currentTime=want;}catch(e){}
-        }else if(c.el.playbackRate!==c.speed)c.el.playbackRate=c.speed;
+        }else if(!c.el.ended)syncRate(c,want);
         setGain(c,t,l,i);
       }
       c.state='playing';
     }else if(pre){
-      if(!img&&c.state==='idle'){c.el.pause();try{c.el.currentTime=c.in;}catch(e){}c.state='ready';}
+      if(img){}
+      else if(c.state==='idle'){c.el.pause();try{c.el.currentTime=c.in;}catch(e){}c.state='ready';}
+      else if(c.state==='ready'&&t>=l.start-WARM){
+        // прогрев декодера: короткий беззвучный play/pause, чтобы на стыке клип стартовал без задержки
+        c.state='warming';
+        if(c.gain)c.gain.gain.value=0; else c.el.volume=0;
+        c.el.playbackRate=c.speed;
+        c.el.play().then(()=>{if(c.state==='warming'){c.el.pause();c.state='warm';}}).catch(()=>{});
+      }
     }else{
       if(!img&&c.state!=='idle')c.el.pause();
       c.state='idle';
     }
   });
+}
+// мягкая синхронизация: догоняем таймлайн небольшим изменением скорости, перематываем только при большом расхождении
+function syncRate(c,want){
+  const drift=c.el.currentTime-want;
+  if(Math.abs(drift)>1){try{c.el.currentTime=want;}catch(e){}c.el.playbackRate=c.speed;return;}
+  const k=Math.abs(drift)<0.04?0:Math.max(-0.1,Math.min(0.1,drift*0.5));
+  const r=c.speed*(1-Math.round(k*50)/50);
+  if(Math.abs(c.el.playbackRate-r)>1e-3)c.el.playbackRate=r;
 }
 function startMusic(t){
   const m=state.music; if(!m)return;
@@ -474,7 +522,9 @@ function tick(){
   if(state.stopAt!=null&&t>=state.stopAt){pause();updateUI();return;}
   syncMedia(t);
   if(state.music)state.music.gain.gain.value=state.musicVol*Math.max(0,Math.min(1,total-t));
-  render(t); updateUI();
+  const sig=frameSig(t);
+  if(state.exporting||sig===null||sig!==lastSig){render(t);lastSig=sig;}
+  updateUI();
   raf=requestAnimationFrame(tick);
 }
 function finishPlayback(){
